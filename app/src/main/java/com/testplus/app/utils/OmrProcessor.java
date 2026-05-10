@@ -199,10 +199,24 @@ public class OmrProcessor {
             Log.i(TAG, "[1.5/6] Aydınlatma düzgünlüğü: spread="
                 + String.format(Locale.US, "%.3f", illuminationSpread)
                 + " (eşik " + String.format(Locale.US, "%.3f", SHADOW_SPREAD_THRESHOLD)
-                + " üzeri → güçlü gölge / tek yönlü ışık)");
+                + " üzeri → per-quadrant normalize dene)");
             if (illuminationSpread >= SHADOW_SPREAD_THRESHOLD) {
-                Log.w(TAG, "  → Okuma iptal: kağıt üzerinde belirgin gölge veya çok düzensiz ışık.");
-                return new ProcessResult(new HashMap<Long, List<String>>(), true, illuminationSpread);
+                // Bloklamak yerine: per-quadrant bilineer normalizasyon uygula, tekrar ölç.
+                // Gölge bölgeler local white-point'e göre parlatılır → bubble kontrastı korunur.
+                Log.w(TAG, "  → Gölge/ışık eşitsizliği: per-quadrant normalizasyon uygulanıyor...");
+                normalizeIlluminationInPlace(pixels, imgW, imgH, pl, ptop, pr, pb);
+                float postSpread = computePaperIlluminationSpread(pixels, imgW, imgH,
+                    pl, ptop, pr, pb);
+                Log.w(TAG, "  → Post-normalize spread="
+                    + String.format(Locale.US, "%.3f", postSpread));
+                if (postSpread >= 0.28f) {
+                    // Normalizasyona rağmen hâlâ çok yüksek → gerçek karanlık/ışık problemi
+                    Log.w(TAG, "  → Okuma iptal: normalizasyon sonrası hâlâ belirgin gölge.");
+                    return new ProcessResult(new HashMap<Long, List<String>>(), true, postSpread);
+                }
+                illuminationSpread = postSpread;
+                Log.i(TAG, "  → Normalizasyon başarılı; okuma devam ediyor (spread="
+                    + String.format(Locale.US, "%.3f", illuminationSpread) + ")");
             }
         }
 
@@ -573,6 +587,62 @@ public class OmrProcessor {
         // dominated by printed content — treat it as neutral rather than "dark".
         if (bgCnt < Math.max(1, totalCnt / 10)) return 0.75f;
         return (bgSum / (float) bgCnt) / 255f;
+    }
+
+    /**
+     * Kağıt alanını 6×6 ızgaraya böler; her hücrenin local white point'ine göre
+     * piksel değerlerini normalize eder. Bilineer interpolasyon ile sert kenar olmadan
+     * gölgeli bölge parlatılır, parlak bölge karartılır → kağıt yüzey aydınlatması eşitlenir.
+     * Bubble'ların kendi koyu değerleri de normalize edilir ama relatif fark korunur.
+     */
+    private static void normalizeIlluminationInPlace(int[] pixels, int imgW, int imgH,
+            int pl, int ptop, int pr, int pb) {
+        final int GRID = 6;
+        int pw = pr - pl;
+        int ph = pb - ptop;
+        if (pw < GRID * 10 || ph < GRID * 10) return;
+
+        // Her hücre için local white-point hesapla (top-%5 parlaklık)
+        float[][] lwp = new float[GRID][GRID];
+        int cellW = pw / GRID;
+        int cellH = ph / GRID;
+        for (int cy = 0; cy < GRID; cy++) {
+            for (int cx = 0; cx < GRID; cx++) {
+                int x0 = pl + cx * cellW;
+                int y0 = ptop + cy * cellH;
+                int x1 = (cx == GRID - 1) ? pr : x0 + cellW;
+                int y1 = (cy == GRID - 1) ? pb : y0 + cellH;
+                lwp[cy][cx] = Math.max(0.45f, estimateWhitePoint(pixels, imgW, imgH, x0, y0, x1, y1));
+            }
+        }
+
+        // Piksel başına bilineer interpolasyon ile normalize et
+        float invPw = (GRID - 1f) / pw;
+        float invPh = (GRID - 1f) / ph;
+        for (int y = ptop; y < pb && y < imgH; y++) {
+            float fcy = (y - ptop) * invPh;
+            int cy0 = Math.max(0, Math.min(GRID - 2, (int) fcy));
+            float fy = fcy - cy0;
+            int rowBase = y * imgW;
+            for (int x = pl; x < pr && x < imgW; x++) {
+                float fcx = (x - pl) * invPw;
+                int cx0 = Math.max(0, Math.min(GRID - 2, (int) fcx));
+                float fx = fcx - cx0;
+                // Bilineer: 4 komşu hücrenin ağırlıklı ortalaması
+                float wp = lwp[cy0    ][cx0    ] * (1 - fx) * (1 - fy)
+                         + lwp[cy0    ][cx0 + 1] *      fx  * (1 - fy)
+                         + lwp[cy0 + 1][cx0    ] * (1 - fx) *      fy
+                         + lwp[cy0 + 1][cx0 + 1] *      fx  *      fy;
+                if (wp < 0.45f) wp = 0.45f;
+                float invWp = 1f / wp;
+                int p = pixels[rowBase + x];
+                int a = (p >> 24) & 0xFF;
+                int r = Math.min(255, (int) (((p >> 16) & 0xFF) * invWp + 0.5f));
+                int g = Math.min(255, (int) (((p >>  8) & 0xFF) * invWp + 0.5f));
+                int b = Math.min(255, (int) (( p        & 0xFF) * invWp + 0.5f));
+                pixels[rowBase + x] = (a << 24) | (r << 16) | (g << 8) | b;
+            }
+        }
     }
 
     /**

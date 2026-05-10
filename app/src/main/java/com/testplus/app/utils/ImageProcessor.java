@@ -410,21 +410,35 @@ public final class ImageProcessor {
     }
 
     /**
-     * LAB uzayı L kanalında CLAHE — gölgeleri yumuşatır; sürekli ton korunur (OMR için).
+     * LAB uzayı L kanalında CLAHE + min-max normalize — gölgeleri agresif biçimde düzeltir;
+     * sürekli ton korunur (OMR için ikili eşikleme yapılmaz).
+     *
+     * <p>clipLimit=5.0, tileSize=4×4: küçük kareler her bölgeyi bağımsız parlatır (gölgeli
+     * köşe ile aydınlık merkez eşitlenir). Ardından Core.normalize ile L kanalı tam dinamik
+     * aralığa gerilir — loş/parlak çekimlerde bubble kontrastı sabit kalır.</p>
      */
     private static void applyClaheShadowNormalize(Mat rgba) {
         if (rgba == null || rgba.empty()) return;
         Mat bgr = new Mat();
         Mat lab = new Mat();
         Mat mergedLab = new Mat();
+        Mat lNorm = new Mat();
         List<Mat> planes = new ArrayList<>(3);
         try {
             Imgproc.cvtColor(rgba, bgr, Imgproc.COLOR_RGBA2BGR);
             Imgproc.cvtColor(bgr, lab, Imgproc.COLOR_BGR2Lab);
             Core.split(lab, planes);
             if (planes.isEmpty()) return;
-            org.opencv.imgproc.CLAHE clahe = Imgproc.createCLAHE(2.0, new Size(8, 8));
+
+            // Güçlü CLAHE: local kontrast dengelemesi (gölge → parlatma, parlak → bastırma)
+            org.opencv.imgproc.CLAHE clahe = Imgproc.createCLAHE(5.0, new Size(4, 4));
             clahe.apply(planes.get(0), planes.get(0));
+
+            // Min-max normalize: tüm L kanalını [0, 255] dinamik aralığa ger → soluk/parlak
+            // çekim farkı kapanır, bubble kontrast yüzdesi sabit kalır
+            Core.normalize(planes.get(0), lNorm, 0, 255, Core.NORM_MINMAX);
+            lNorm.copyTo(planes.get(0));
+
             Core.merge(planes, mergedLab);
             Imgproc.cvtColor(mergedLab, bgr, Imgproc.COLOR_Lab2BGR);
             Imgproc.cvtColor(bgr, rgba, Imgproc.COLOR_BGR2RGBA);
@@ -432,6 +446,7 @@ public final class ImageProcessor {
             bgr.release();
             lab.release();
             mergedLab.release();
+            lNorm.release();
             for (Mat p : planes) {
                 if (p != null) p.release();
             }
