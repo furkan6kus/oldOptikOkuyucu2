@@ -41,6 +41,7 @@ import com.testplus.app.utils.NetHesaplayici;
 import com.testplus.app.utils.OmrProcessor;
 import com.testplus.app.utils.PdfGenerator;
 import com.testplus.app.views.AlignmentOverlayView;
+import com.testplus.app.views.DocumentCropView;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.util.*;
@@ -73,7 +74,7 @@ public class KagitOkuActivity extends AppCompatActivity {
     private LinearLayout bottomBar;
     private AlignmentOverlayView alignmentOverlay;
     private FrameLayout previewOverlay;
-    private ImageView ivOnizleme;
+    private DocumentCropView docCropView;
     /** Kamera önizlemesinde onay bekleyen görsel; iptalde recycle edilir. */
     private Bitmap pendingPreviewBitmap;
     private OptikForm cachedForm;
@@ -163,7 +164,7 @@ public class KagitOkuActivity extends AppCompatActivity {
         btnCek = findViewById(R.id.btnCek);
         bottomBar = findViewById(R.id.bottomBar);
         previewOverlay = findViewById(R.id.previewOverlay);
-        ivOnizleme = findViewById(R.id.ivOnizleme);
+        docCropView = findViewById(R.id.docCropView);
         Button btnOnizlemeTekrar = findViewById(R.id.btnOnizlemeTekrar);
         Button btnOnizlemeOnay = findViewById(R.id.btnOnizlemeOnay);
         if (btnOnizlemeTekrar != null) {
@@ -357,11 +358,42 @@ public class KagitOkuActivity extends AppCompatActivity {
             pendingPreviewBitmap.recycle();
         }
         pendingPreviewBitmap = bmp;
-        if (ivOnizleme != null) ivOnizleme.setImageBitmap(bmp);
+        // Önce bitmap'i varsayılan köşelerle göster; köşe tespiti arka planda tamamlanınca günceller
+        if (docCropView != null) docCropView.setBitmapAndCorners(bmp, null);
         if (previewOverlay != null) previewOverlay.setVisibility(View.VISIBLE);
         if (alignmentOverlay != null) alignmentOverlay.setProcessingText(null);
         Log.i(PREVIEW_TAG, "preview overlay visible="
             + (previewOverlay != null && previewOverlay.getVisibility() == View.VISIBLE));
+
+        // Arka planda OpenScan köşe tespiti çalıştır; bulunca crop view'i güncelle
+        if (bmp != null) {
+            final Bitmap detectBmp = bmp;
+            executor.execute(() -> {
+                PointF[] detected = null;
+                try {
+                    if (ImageProcessor.initOpenCv()) {
+                        detected = ImageProcessor.findDocumentCornersOnly(detectBmp);
+                    }
+                } catch (Throwable t) {
+                    Log.w(PREVIEW_TAG, "corner detection exception", t);
+                }
+                final PointF[] corners = detected;
+                runOnUiThread(() -> {
+                    // Önizleme hâlâ açıksa ve aynı bitmap gösteriliyorsa köşeleri güncelle
+                    if (previewOverlay != null
+                            && previewOverlay.getVisibility() == View.VISIBLE
+                            && pendingPreviewBitmap == detectBmp
+                            && docCropView != null) {
+                        if (corners != null) {
+                            docCropView.setCorners(corners);
+                            Log.i(PREVIEW_TAG, "corner detection OK → crop view updated");
+                        } else {
+                            Log.w(PREVIEW_TAG, "corner detection returned null → default corners kept");
+                        }
+                    }
+                });
+            });
+        }
     }
 
     /** @param confirm true ise optik okumaya gönderir */
@@ -373,7 +405,7 @@ public class KagitOkuActivity extends AppCompatActivity {
                 pendingPreviewBitmap.recycle();
             }
             pendingPreviewBitmap = null;
-            if (ivOnizleme != null) ivOnizleme.setImageBitmap(null);
+            if (docCropView != null) docCropView.setBitmapAndCorners(null, null);
             if (previewOverlay != null) previewOverlay.setVisibility(View.GONE);
             autoCaptureTriggered = false;
             alignedFrameCount = 0;
@@ -395,34 +427,59 @@ public class KagitOkuActivity extends AppCompatActivity {
 
     /**
      * Önizleme akışını bloklamamak için warp burada (onay sonrası) uygulanır.
-     * Böylece kullanıcı hızlı önizleme görür; okuma ise perspektif düzeltilmiş görselle yapılır.
+     * Kullanıcının crop view üzerinde ayarladığı köşeler varsa bunlar kullanılır;
+     * yoksa OpenScan'ın tam otomatik tespitine düşülür.
      */
     private void processConfirmedBitmapForRead(Bitmap original) {
         Bitmap input = original;
         try {
             if (input != null && ImageProcessor.initOpenCv()) {
+                // Kullanıcının (veya otomatik tespitinin) crop view köşelerini al
+                final PointF[] userCorners = (docCropView != null)
+                    ? docCropView.getCornersInBitmapSpace() : null;
+
                 final Bitmap warpInput = input;
-                FutureTask<Bitmap> warpTask = new FutureTask<>(
-                    () -> ImageProcessor.scanDocumentWarpForOmr(warpInput));
-                Thread warpThread = new Thread(warpTask, "omr-warp-confirm");
-                warpThread.start();
                 Bitmap warped = null;
-                try {
-                    warped = warpTask.get(1800, TimeUnit.MILLISECONDS);
-                } catch (TimeoutException te) {
-                    warpThread.interrupt();
-                    Log.w(PREVIEW_TAG, "confirm-stage warp timeout; raw image used");
+
+                if (userCorners != null) {
+                    // Kullanıcı tarafından ayarlanmış köşelerle warp uygula
+                    FutureTask<Bitmap> warpTask = new FutureTask<>(
+                        () -> ImageProcessor.warpFromBitmapCorners(warpInput, userCorners));
+                    Thread warpThread = new Thread(warpTask, "omr-warp-corners");
+                    warpThread.start();
+                    try {
+                        warped = warpTask.get(1800, TimeUnit.MILLISECONDS);
+                        Log.i(PREVIEW_TAG, "confirm-stage warp from user corners");
+                    } catch (TimeoutException te) {
+                        warpThread.interrupt();
+                        Log.w(PREVIEW_TAG, "corner-warp timeout; fallback to auto");
+                    }
                 }
+
+                if (warped == null) {
+                    // Fallback: tam otomatik OpenScan tespiti
+                    FutureTask<Bitmap> warpTask = new FutureTask<>(
+                        () -> ImageProcessor.scanDocumentWarpForOmr(warpInput));
+                    Thread warpThread = new Thread(warpTask, "omr-warp-auto");
+                    warpThread.start();
+                    try {
+                        warped = warpTask.get(1800, TimeUnit.MILLISECONDS);
+                        Log.i(PREVIEW_TAG, "confirm-stage auto warp applied");
+                    } catch (TimeoutException te) {
+                        warpThread.interrupt();
+                        Log.w(PREVIEW_TAG, "auto warp timeout; raw image used");
+                    }
+                }
+
                 if (warped != null) {
-                    // Önizleme ImageView hâlâ pendingPreviewBitmap gösteriyor; onu recycle etme.
                     if (warped != input && !input.isRecycled() && input != pendingPreviewBitmap) {
                         input.recycle();
                     }
                     input = warped;
-                    Log.i(PREVIEW_TAG, "confirm-stage warp applied="
+                    Log.i(PREVIEW_TAG, "confirm-stage warp final="
                         + input.getWidth() + "x" + input.getHeight());
                 } else {
-                    Log.w(PREVIEW_TAG, "confirm-stage warp null/timeout; raw image used");
+                    Log.w(PREVIEW_TAG, "confirm-stage warp null; raw image used");
                 }
             }
         } catch (Throwable t) {

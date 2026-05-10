@@ -63,6 +63,74 @@ public final class ImageProcessor {
     }
 
     /**
+     * OpenScan tarzı köşe tespiti yapar; bulunan 4 köşeyi bitmap piksel uzayında döndürür.
+     * Sıra: TL, TR, BR, BL. Bulunamazsa null döner.
+     */
+    public static PointF[] findDocumentCornersOnly(Bitmap source) {
+        if (source == null || source.isRecycled()) return null;
+        if (!openCvInitialized && !initOpenCv()) return null;
+
+        Mat rgba = new Mat();
+        try {
+            Utils.bitmapToMat(source, rgba);
+            if (rgba.empty()) return null;
+
+            Point[] quad = findQuadOpenScanStyle(rgba);
+            if (quad == null) quad = findBestDocumentQuad(rgba);
+            if (quad == null) quad = findQuadFromCornerMarkers(rgba, source);
+            if (quad == null) return null;
+
+            // quad sırası: TL, TR, BR, BL
+            return new PointF[]{
+                new PointF((float) quad[0].x, (float) quad[0].y),
+                new PointF((float) quad[1].x, (float) quad[1].y),
+                new PointF((float) quad[2].x, (float) quad[2].y),
+                new PointF((float) quad[3].x, (float) quad[3].y)
+            };
+        } finally {
+            rgba.release();
+        }
+    }
+
+    /**
+     * Verilen bitmap piksel uzayı köşelerini kullanarak perspektif düzeltmesi yapar.
+     * Köşe sırası: TL, TR, BR, BL. CLAHE gölge normalizasyonu da uygulanır.
+     */
+    public static Bitmap warpFromBitmapCorners(Bitmap source, PointF[] corners) {
+        if (source == null || source.isRecycled()) return null;
+        if (corners == null || corners.length < 4
+                || corners[0] == null || corners[1] == null
+                || corners[2] == null || corners[3] == null) return null;
+        if (!openCvInitialized && !initOpenCv()) return null;
+
+        Mat rgba = new Mat();
+        Mat warped = null;
+        try {
+            Utils.bitmapToMat(source, rgba);
+            if (rgba.empty()) return null;
+
+            Point[] quad = new Point[]{
+                new Point(corners[0].x, corners[0].y),
+                new Point(corners[1].x, corners[1].y),
+                new Point(corners[2].x, corners[2].y),
+                new Point(corners[3].x, corners[3].y)
+            };
+
+            warped = warpPerspectiveToRectangle(rgba, quad);
+            if (warped == null || warped.empty()) return null;
+
+            applyClaheShadowNormalize(warped);
+
+            Bitmap out = Bitmap.createBitmap(warped.cols(), warped.rows(), Bitmap.Config.ARGB_8888);
+            Utils.matToBitmap(warped, out);
+            return out;
+        } finally {
+            rgba.release();
+            if (warped != null) warped.release();
+        }
+    }
+
+    /**
      * Perspektif düzeltilmiş renkli görüntü — mevcut OMR ile uyumlu (sürekli ton).
      */
     public static Bitmap scanDocumentWarpForOmr(Bitmap source) {
