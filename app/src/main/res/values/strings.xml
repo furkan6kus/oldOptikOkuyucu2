@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TestPlus</string>
+    <string name="sinavlar">Sınavlar</string>
+    <string name="optikler">Optikler</string>
+    <string name="kaydet">Kaydet</string>
+    <string name="tamam">Tamam</string>
+    <string name="iptal">İptal</string>
+    <string name="sil">Sil</string>
+    <string name="duzenle">Düzenle</string>
+    <string name="yeni_optik_form">Yeni Optik Form</string>
+    <string name="yeni_sinav">Yeni Sınav</string>
+    <string name="zorunlu_alanlar">* Zorunlu Alanlar</string>
+    <string name="on_izleme">Ön İzleme</string>
+</resources>
